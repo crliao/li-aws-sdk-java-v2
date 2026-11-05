@@ -242,11 +242,18 @@ public final class NettyRequestExecutor {
     }
 
     private void writeRequest(HttpRequest request) {
+        if (shouldWriteAsEmptyFullRequest(request)) {
+            // Still subscribe to the (empty) request publisher: some bodies, e.g.
+            // AsyncRequestBody.forBlockingInputStream(0L), block their producer until they are subscribed to.
+            context.executeRequest().requestContentPublisher().subscribe(new EmptyBodySubscriber(request));
+            return;
+        }
+        writeToChannel(new StreamedRequest(request, context.executeRequest().requestContentPublisher()));
+    }
+
+    private void writeToChannel(HttpRequest requestToWrite) {
         channel.pipeline().addFirst(new WriteTimeoutHandler(context.configuration().writeTimeoutMillis(),
                                                             TimeUnit.MILLISECONDS));
-        HttpRequest requestToWrite = shouldWriteAsEmptyFullRequest(request)
-                                     ? toEmptyFullRequest(request)
-                                     : new StreamedRequest(request, context.executeRequest().requestContentPublisher());
         channel.writeAndFlush(requestToWrite)
                .addListener(wireCall -> {
                    // Done writing so remove the idle write timeout handler
@@ -318,6 +325,88 @@ public final class NettyRequestExecutor {
     private static FullHttpRequest toEmptyFullRequest(HttpRequest request) {
         return new DefaultFullHttpRequest(request.protocolVersion(), request.method(), request.uri(),
                                           Unpooled.EMPTY_BUFFER, request.headers(), EmptyHttpHeaders.INSTANCE);
+    }
+
+    /**
+     * Drives the lifecycle of a request publisher that declared a zero content length, then writes the request as a
+     * single {@link FullHttpRequest} (HEADERS with END_STREAM) once the publisher completes. Publisher errors fail the
+     * request, and the subscription is cancelled if the request fails or is cancelled first.
+     */
+    private final class EmptyBodySubscriber implements Subscriber<ByteBuffer> {
+        private final HttpRequest request;
+        private final boolean contentLengthHeaderPresent;
+        private Subscription subscription;
+        private boolean done;
+
+        private EmptyBodySubscriber(HttpRequest request) {
+            this.request = request;
+            this.contentLengthHeaderPresent = request.headers().contains(HttpHeaderNames.CONTENT_LENGTH);
+        }
+
+        @Override
+        public void onSubscribe(Subscription s) {
+            if (subscription != null) {
+                s.cancel();
+                return;
+            }
+            subscription = s;
+            executeFuture.whenComplete((r, t) -> {
+                if (t != null) {
+                    s.cancel();
+                }
+            });
+            s.request(Long.MAX_VALUE);
+        }
+
+        @Override
+        public void onNext(ByteBuffer byteBuffer) {
+            if (done || !byteBuffer.hasRemaining()) {
+                return;
+            }
+            subscription.cancel();
+            if (contentLengthHeaderPresent) {
+                // Same as StreamedRequest: content beyond the declared Content-Length (0) is not sent.
+                complete();
+            } else {
+                onError(new IllegalStateException("Request content publisher declared a content length of 0 but "
+                                                  + "published " + byteBuffer.remaining() + " bytes."));
+            }
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            if (done) {
+                return;
+            }
+            done = true;
+            NettyUtils.doInEventLoop(channel.eventLoop(), () -> {
+                closeAndRelease(channel);
+                handleFailure(channel, () -> "Failed to read request content for " + endpoint(), t);
+            });
+        }
+
+        @Override
+        public void onComplete() {
+            complete();
+        }
+
+        private void complete() {
+            if (done) {
+                return;
+            }
+            done = true;
+            NettyUtils.doInEventLoop(channel.eventLoop(), () -> {
+                if (executeFuture.isDone()) {
+                    return;
+                }
+                try {
+                    writeToChannel(toEmptyFullRequest(request));
+                } catch (Throwable t) {
+                    closeAndRelease(channel);
+                    handleFailure(channel, () -> "Failed to make request to " + endpoint(), t);
+                }
+            });
+        }
     }
 
     /**
