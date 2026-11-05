@@ -71,7 +71,7 @@ public class HttpToHttp2OutboundAdapter extends ChannelOutboundHandlerAdapter {
                 // Convert and write the headers.
                 Http2Headers http2Headers = HttpConversionUtil.toHttp2Headers(httpMsg, false);
                 endStream = msg instanceof FullHttpMessage && !((FullHttpMessage) msg).content().isReadable();
-                ctx.write(new DefaultHttp2HeadersFrame(http2Headers), promiseAggregator.newPromise());
+                ctx.write(new DefaultHttp2HeadersFrame(http2Headers, endStream), promiseAggregator.newPromise());
 
             }
 

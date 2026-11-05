@@ -33,8 +33,12 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.DecoderResult;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpContent;
+import io.netty.handler.codec.http.EmptyHttpHeaders;
+import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
@@ -240,12 +244,21 @@ public final class NettyRequestExecutor {
     private void writeRequest(HttpRequest request) {
         channel.pipeline().addFirst(new WriteTimeoutHandler(context.configuration().writeTimeoutMillis(),
                                                             TimeUnit.MILLISECONDS));
-        StreamedRequest streamedRequest = new StreamedRequest(request,
-                                                              context.executeRequest().requestContentPublisher());
-        channel.writeAndFlush(streamedRequest)
+        HttpRequest requestToWrite = shouldWriteAsEmptyFullRequest(request)
+                                     ? toEmptyFullRequest(request)
+                                     : new StreamedRequest(request, context.executeRequest().requestContentPublisher());
+        channel.writeAndFlush(requestToWrite)
                .addListener(wireCall -> {
                    // Done writing so remove the idle write timeout handler
                    ChannelUtils.removeIfExists(channel.pipeline(), WriteTimeoutHandler.class);
+                   if (!wireCall.isSuccess() && isResponseCompletedSuccessfully()) {
+                       // The server may respond and close/reset the stream before our END_STREAM has been written
+                       // (e.g. RST_STREAM(NO_ERROR), RFC 9113 section 8.1). The response has already been delivered
+                       // and the channel released, so this late write failure must not fail the request.
+                       log.debug(channel, () -> "Ignoring request write failure after the response completed for "
+                                                + endpoint(), wireCall.cause());
+                       return;
+                   }
                    if (wireCall.isSuccess()) {
                        NettyRequestMetrics.publishHttp2StreamMetrics(context.metricCollector(), channel);
 
@@ -276,6 +289,35 @@ public final class NettyRequestExecutor {
 
             channel.read();
         }
+    }
+
+    private boolean isResponseCompletedSuccessfully() {
+        return executeFuture.isDone() && !executeFuture.isCompletedExceptionally();
+    }
+
+    /**
+     * For HTTP/2 requests without a body, send a single HEADERS frame with END_STREAM instead of HEADERS followed by
+     * a separate empty DATA(END_STREAM) frame. Otherwise the server can respond and reset the stream before the
+     * trailing empty DATA frame is written, which fails a request whose response was already received.
+     */
+    private boolean shouldWriteAsEmptyFullRequest(HttpRequest request) {
+        if (ChannelAttributeKey.getProtocolNow(channel) != Protocol.HTTP2
+            || context.executeRequest().fullDuplex()
+            || is100ContinueExpected()) {
+            return false;
+        }
+        Optional<Long> publisherLength = context.executeRequest().requestContentPublisher().contentLength();
+        if (!publisherLength.isPresent() || publisherLength.get() != 0L) {
+            return false;
+        }
+        String contentLength = request.headers().get(HttpHeaderNames.CONTENT_LENGTH);
+        return (contentLength == null || "0".equals(contentLength.trim()))
+               && !request.headers().contains(HttpHeaderNames.TRANSFER_ENCODING);
+    }
+
+    private static FullHttpRequest toEmptyFullRequest(HttpRequest request) {
+        return new DefaultFullHttpRequest(request.protocolVersion(), request.method(), request.uri(),
+                                          Unpooled.EMPTY_BUFFER, request.headers(), EmptyHttpHeaders.INSTANCE);
     }
 
     /**
