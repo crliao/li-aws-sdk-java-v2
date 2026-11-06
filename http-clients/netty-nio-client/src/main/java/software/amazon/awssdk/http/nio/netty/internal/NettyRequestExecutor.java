@@ -380,6 +380,10 @@ public final class NettyRequestExecutor {
             }
             done = true;
             NettyUtils.doInEventLoop(channel.eventLoop(), () -> {
+                if (executeFuture.isDone()) {
+                    // The request already completed or was cancelled; the publisher error raced with it.
+                    return;
+                }
                 closeAndRelease(channel);
                 handleFailure(channel, () -> "Failed to read request content for " + endpoint(), t);
             });

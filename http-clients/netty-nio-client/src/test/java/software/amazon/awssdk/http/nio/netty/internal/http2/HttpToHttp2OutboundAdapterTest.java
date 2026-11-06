@@ -31,6 +31,7 @@ import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http2.Http2DataFrame;
 import io.netty.handler.codec.http2.Http2HeadersFrame;
 import io.netty.handler.codec.http2.HttpConversionUtil;
 import java.util.List;
@@ -94,6 +95,33 @@ public class HttpToHttp2OutboundAdapterTest {
         verify(ctx, times(1)).write(frameCaptor.capture(), any(ChannelPromise.class));
         assertThat(frameCaptor.getValue()).isInstanceOf(Http2HeadersFrame.class);
         assertThat(((Http2HeadersFrame) frameCaptor.getValue()).isEndStream()).isTrue();
+    }
+
+    @Test
+    public void emptyFullRequestWithTrailers_endsStreamOnTrailers() {
+        when(ctx.executor()).thenReturn(EVENT_LOOP_GROUP.next());
+        when(ctx.channel()).thenReturn(channel);
+
+        HttpToHttp2OutboundAdapter adapter = new HttpToHttp2OutboundAdapter();
+        ChannelPromise writePromise = new DefaultChannelPromise(channel, EVENT_LOOP_GROUP.next());
+
+        FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/", Unpooled.EMPTY_BUFFER);
+        request.headers().add(HttpConversionUtil.ExtensionHeaderNames.SCHEME.text(), "http");
+        request.trailingHeaders().add("x-checksum", "abc");
+        adapter.write(ctx, request, writePromise);
+
+        ArgumentCaptor<Object> frameCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(ctx, times(3)).write(frameCaptor.capture(), any(ChannelPromise.class));
+        List<Object> frames = frameCaptor.getAllValues();
+
+        assertThat(frames.get(0)).isInstanceOf(Http2HeadersFrame.class);
+        assertThat(((Http2HeadersFrame) frames.get(0)).isEndStream()).isFalse();
+        assertThat(frames.get(1)).isInstanceOf(Http2DataFrame.class);
+        assertThat(((Http2DataFrame) frames.get(1)).isEndStream()).isFalse();
+        assertThat(frames.get(2)).isInstanceOf(Http2HeadersFrame.class);
+        Http2HeadersFrame trailers = (Http2HeadersFrame) frames.get(2);
+        assertThat(trailers.isEndStream()).isTrue();
+        assertThat(trailers.headers().get("x-checksum")).hasToString("abc");
     }
 
     private void writeRequest(HttpToHttp2OutboundAdapter adapter, ChannelPromise promise) {
